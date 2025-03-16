@@ -8,6 +8,11 @@ services:
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
       POSTGRES_MULTIPLE_DATABASES: 'airflow,analytics'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     ports:
       - "5432:5432"
     volumes:
@@ -23,11 +28,19 @@ services:
     environment:
       MONGO_INITDB_ROOT_USERNAME: admin
       MONGO_INITDB_ROOT_PASSWORD: admin
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   airflow-init:
     build: ./airflow
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
@@ -36,7 +49,18 @@ services:
       - ./scripts:/opt/airflow/scripts
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
-    command: bash -c "airflow db init && airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin"
+    command: bash -c "
+        until airflow db check; do sleep 5; done;
+        airflow db init && 
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+      "
+    restart: on-failure
 
   airflow-webserver:
     build: ./airflow
@@ -45,9 +69,8 @@ services:
       - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
     depends_on:
-      - postgres
-      - mongodb
-      - airflow-init
+      airflow-init:
+        condition: service_completed_successfully
     ports:
       - "8080:8080"
     volumes:
@@ -55,7 +78,15 @@ services:
       - ./scripts:/opt/airflow/scripts
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
-    command: webserver
+    command: bash -c "
+        until airflow db check; do sleep 5; done;
+        airflow webserver
+      "
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   airflow-scheduler:
     build: ./airflow
@@ -63,21 +94,29 @@ services:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
     depends_on:
-      - airflow-webserver
+      airflow-webserver:
+        condition: service_healthy
     volumes:
       - ./dags:/opt/airflow/dags
       - ./scripts:/opt/airflow/scripts
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
-    command: scheduler
+    command: bash -c "
+        until airflow db check; do sleep 5; done;
+        airflow scheduler
+      "
 
   data-generator:
     build: ./airflow
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
     volumes:
       - ./scripts:/opt/airflow/scripts
-    command: python /opt/airflow/scripts/generate_data.py
+    command: bash -c "
+        until nc -zv mongodb 27017; do sleep 5; done;
+        python /opt/airflow/scripts/generate_data.py
+      "
 
 volumes:
   postgres_data:
