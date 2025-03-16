@@ -2,16 +2,17 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 from pymongo import MongoClient
+from psycopg2.extras import execute_batch
 import psycopg2
 import json
 import logging
-from typing import Any
+from typing import Any, List
 
 logger = logging.getLogger(__name__)
 
 
 def json_serializer(obj: Any) -> str:
-    """Custom JSON serializer for non-serializable objects"""
+    """Custom JSON serializer for datetime objects"""
     if isinstance(obj, datetime):
         return obj.isoformat()
     raise TypeError(f"Type {type(obj)} not serializable")
@@ -26,10 +27,16 @@ default_args = {
 }
 
 
-def migrate_collection(collection_name: str, table_name: str, transform_fn: callable):
+def migrate_collection(
+        collection_name: str,
+        table_name: str,
+        transform_fn: callable,
+        key_fields: List[str],
+        batch_size: int = 1000
+):
     def _migrate():
         try:
-            logger.info(f"Starting migration for {collection_name}")
+            logger.info(f"Starting incremental sync for {collection_name}")
 
             # MongoDB connection
             mongo_client = MongoClient(
@@ -49,29 +56,56 @@ def migrate_collection(collection_name: str, table_name: str, transform_fn: call
             )
             cur = conn.cursor()
 
-            # Clear existing data
-            cur.execute(f"TRUNCATE TABLE {table_name} RESTART IDENTITY")
+            # Get last sync timestamp
+            cur.execute(f"SELECT MAX(last_modified) FROM {table_name}")
+            last_ts = cur.fetchone()[0] or datetime.min
 
-            # Transfer data
-            total = 0
-            for doc in mongo_col.find():
+            # MongoDB query with projection
+            query = {"last_modified": {"$gt": last_ts}}
+            projection = {"_id": 0}
+            cursor = mongo_col.find(query, projection).sort("last_modified", 1)
+
+            # Batch processing setup
+            columns, data_batch = [], []
+            insert_query = None
+
+            for doc in cursor:
                 try:
                     data = transform_fn(doc)
-                    columns = ', '.join(data.keys())
-                    placeholders = ', '.join(['%s'] * len(data))
 
-                    query = f"""
-                        INSERT INTO {table_name} ({columns})
-                        VALUES ({placeholders})
-                    """
-                    cur.execute(query, list(data.values()))
-                    total += 1
+                    if not columns:
+                        columns = list(data.keys())
+                        placeholders = ['%s'] * len(columns)
+                        update_fields = [f for f in columns if f not in key_fields]
+                        update_set = ', '.join([f"{f} = EXCLUDED.{f}" for f in update_fields])
+
+                        insert_query = f"""
+                            INSERT INTO {table_name} ({', '.join(columns)})
+                            VALUES ({', '.join(placeholders)})
+                            ON CONFLICT ({', '.join(key_fields)})
+                            DO UPDATE SET {update_set}
+                        """
+
+                    data_batch.append(tuple(data.values()))
+
+                    # Execute batch insert
+                    if len(data_batch) >= batch_size:
+                        execute_batch(cur, insert_query, data_batch)
+                        conn.commit()
+                        logger.info(f"Inserted {len(data_batch)} records")
+                        data_batch = []
+
                 except Exception as e:
-                    logger.error(f"Error in document {doc.get('_id')}: {str(e)}")
+                    logger.error(f"Error in document: {str(e)}")
                     continue
 
-            conn.commit()
-            logger.info(f"Successfully migrated {total} records to {table_name}")
+            # Insert remaining records
+            if data_batch:
+                execute_batch(cur, insert_query, data_batch)
+                conn.commit()
+                logger.info(f"Inserted final {len(data_batch)} records")
+
+            logger.info(f"Total processed: {cursor.retrieved} records")
 
         except Exception as e:
             logger.error(f"Critical error: {str(e)}", exc_info=True)
@@ -83,7 +117,8 @@ def migrate_collection(collection_name: str, table_name: str, transform_fn: call
     return _migrate
 
 
-def create_analytical_views():
+def refresh_analytical_views():
+    """Refresh materialized views in PostgreSQL"""
     conn = psycopg2.connect(
         dbname="analytics",
         user="airflow",
@@ -92,23 +127,28 @@ def create_analytical_views():
     )
     cur = conn.cursor()
 
-    # Refresh materialized views
-    cur.execute("REFRESH MATERIALIZED VIEW user_activity")
-    cur.execute("REFRESH MATERIALIZED VIEW support_efficiency")
-
-    conn.commit()
-    conn.close()
+    try:
+        cur.execute("REFRESH MATERIALIZED VIEW user_activity")
+        cur.execute("REFRESH MATERIALIZED VIEW support_efficiency")
+        conn.commit()
+        logger.info("Successfully refreshed materialized views")
+    except Exception as e:
+        logger.error(f"Error refreshing views: {str(e)}")
+        raise
+    finally:
+        conn.close()
 
 
 with DAG(
         'data_replication',
         default_args=default_args,
         start_date=datetime(2023, 1, 1),
-        schedule_interval='@daily',
+        schedule_interval='@hourly',
         catchup=False,
-        tags=['data_pipeline']
+        tags=['data_pipeline'],
+        max_active_runs=1
 ) as dag:
-    # 1. User Sessions
+    # Region: Collection replication tasks
     replicate_user_sessions = PythonOperator(
         task_id='replicate_user_sessions',
         python_callable=migrate_collection(
@@ -120,13 +160,15 @@ with DAG(
                 'start_time': doc['start_time'].isoformat(),
                 'end_time': doc['end_time'].isoformat(),
                 'pages_visited': json.dumps(doc['pages_visited']),
-                'device': str(doc['device']),
-                'actions': json.dumps(doc['actions'])
-            }
+                'device': doc['device'],
+                'actions': json.dumps(doc['actions']),
+                'last_modified': doc['last_modified'].isoformat()
+            },
+            key_fields=['session_id'],
+            batch_size=2000
         )
     )
 
-    # 2. Product Price History
     replicate_product_prices = PythonOperator(
         task_id='replicate_product_prices',
         python_callable=migrate_collection(
@@ -135,22 +177,21 @@ with DAG(
             lambda doc: {
                 'product_id': str(doc['product_id']),
                 'price_changes': json.dumps(
-                    [
-                        {
-                            "date": change['date'].isoformat(),
-                            "price": float(change['price'])
-                        }
-                        for change in doc['price_changes']
-                    ],
+                    [{
+                        'date': change['date'].isoformat(),
+                        'price': float(change['price'])
+                    } for change in doc['price_changes']],
                     default=json_serializer
                 ),
                 'current_price': float(doc['current_price']),
-                'currency': str(doc['currency'])
-            }
+                'currency': doc['currency'],
+                'last_modified': doc['last_modified'].isoformat()
+            },
+            key_fields=['product_id'],
+            batch_size=1000
         )
     )
 
-    # 3. Event Logs
     replicate_event_logs = PythonOperator(
         task_id='replicate_event_logs',
         python_callable=migrate_collection(
@@ -159,13 +200,14 @@ with DAG(
             lambda doc: {
                 'event_id': str(doc['event_id']),
                 'timestamp': doc['timestamp'].isoformat(),
-                'event_type': str(doc['event_type']),
-                'details': json.dumps(doc['details'], default=json_serializer)
-            }
+                'event_type': doc['event_type'],
+                'details': json.dumps(doc['details'], default=json_serializer),
+                'last_modified': doc['last_modified'].isoformat()
+            },
+            key_fields=['event_id']
         )
     )
 
-    # 4. Support Tickets
     replicate_support_tickets = PythonOperator(
         task_id='replicate_support_tickets',
         python_callable=migrate_collection(
@@ -174,16 +216,17 @@ with DAG(
             lambda doc: {
                 'ticket_id': str(doc['ticket_id']),
                 'user_id': str(doc['user_id']),
-                'status': str(doc['status']),
-                'issue_type': str(doc['issue_type']),
+                'status': doc['status'],
+                'issue_type': doc['issue_type'],
                 'messages': json.dumps(doc['messages']),
                 'created_at': doc['created_at'].isoformat(),
-                'updated_at': doc['updated_at'].isoformat()
-            }
+                'updated_at': doc['updated_at'].isoformat(),
+                'last_modified': doc['last_modified'].isoformat()
+            },
+            key_fields=['ticket_id']
         )
     )
 
-    # 5. User Recommendations
     replicate_recommendations = PythonOperator(
         task_id='replicate_recommendations',
         python_callable=migrate_collection(
@@ -192,12 +235,13 @@ with DAG(
             lambda doc: {
                 'user_id': str(doc['user_id']),
                 'recommended_products': json.dumps(doc['recommended_products']),
-                'last_updated': doc['last_updated'].isoformat()
-            }
+                'last_updated': doc['last_updated'].isoformat(),
+                'last_modified': doc['last_modified'].isoformat()
+            },
+            key_fields=['user_id']
         )
     )
 
-    # 6. Moderation Queue
     replicate_moderation = PythonOperator(
         task_id='replicate_moderation',
         python_callable=migrate_collection(
@@ -207,16 +251,17 @@ with DAG(
                 'review_id': str(doc['review_id']),
                 'user_id': str(doc['user_id']),
                 'product_id': str(doc['product_id']),
-                'review_text': str(doc['review_text']),
-                'rating': int(doc['rating']),
-                'moderation_status': str(doc['moderation_status']),
+                'review_text': doc['review_text'],
+                'rating': doc['rating'],
+                'moderation_status': doc['moderation_status'],
                 'flags': json.dumps(doc['flags']),
-                'submitted_at': doc['submitted_at'].isoformat()
-            }
+                'submitted_at': doc['submitted_at'].isoformat(),
+                'last_modified': doc['last_modified'].isoformat()
+            },
+            key_fields=['review_id']
         )
     )
 
-    # 7. Search Queries
     replicate_search_queries = PythonOperator(
         task_id='replicate_search_queries',
         python_callable=migrate_collection(
@@ -225,21 +270,23 @@ with DAG(
             lambda doc: {
                 'query_id': str(doc['query_id']),
                 'user_id': str(doc['user_id']),
-                'query_text': str(doc['query_text']),
+                'query_text': doc['query_text'],
                 'timestamp': doc['timestamp'].isoformat(),
                 'filters': json.dumps(doc['filters'], default=json_serializer),
-                'results_count': int(doc['results_count'])
-            }
+                'results_count': doc['results_count'],
+                'last_modified': doc['last_modified'].isoformat()
+            },
+            key_fields=['query_id']
         )
     )
 
-    # 8. Create Views
-    create_views = PythonOperator(
-        task_id='create_analytical_views',
-        python_callable=create_analytical_views
+    # Region: Post-processing tasks
+    refresh_views = PythonOperator(
+        task_id='refresh_analytical_views',
+        python_callable=refresh_analytical_views
     )
 
-    # Define dependencies
+    # Define workflow
     (
             replicate_user_sessions
             >> replicate_product_prices
@@ -248,5 +295,5 @@ with DAG(
             >> replicate_recommendations
             >> replicate_moderation
             >> replicate_search_queries
-            >> create_views
+            >> refresh_views
     )
